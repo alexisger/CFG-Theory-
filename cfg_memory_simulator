@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""
+CFG with Quantum Memory - Simulator
+Simulation of double-slit experiment with memory in quantum vacuum noise
+
+Key Innovation: Electrons "communicate" through the quantum vacuum noise
+Each electron "imprints" the noise, which retains memory for time τ = 1/γ
+
+Author: Alex Gerassis
+Date: November 2025
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy.integrate import solve_ivp
+from scipy.interpolate import RectBivariateSpline
+from scipy.ndimage import gaussian_filter
+import time
+
+class CFGMemorySimulator:
+    """
+    CFG Simulator with Quantum Memory Effect
+    """
+    
+    def __init__(self, mass=1.0, hbar=1.0, slit_separation=1.0, 
+                 slit_width=0.15, wavelength=0.1, 
+                 gamma=0.1, coupling=1.0):
+        """
+        Parameters:
+        -----------
+        mass, hbar, slit_separation, slit_width, wavelength: as before
+        gamma : float
+            Memory decay rate (1/s). Memory time τ = 1/γ
+        coupling : float
+            Coupling constant g between electron and noise
+        """
+        self.m = mass
+        self.hbar = hbar
+        self.d = slit_separation
+        self.a = slit_width
+        self.wavelength = wavelength
+        self.k = 2 * np.pi / wavelength
+        
+        # Memory parameters
+        self.gamma = gamma  # Decay rate
+        self.tau_memory = 1.0 / gamma if gamma > 0 else np.inf  # Memory time
+        self.g_coupling = coupling
+        
+        # History tracking
+        self.electron_history = []  # List of (wavefunction, time) tuples
+        self.noise_field = None  # Current state of correlated noise
+        
+    def initialize_noise_field(self, X, Y):
+        """
+        Initialize uncorrelated quantum noise
+        """
+        # Uncorrelated Gaussian white noise
+        noise = np.random.randn(*X.shape) + 1j * np.random.randn(*X.shape)
+        noise = noise / np.sqrt(2)  # Normalize
+        
+        self.noise_field = {
+            'xi': noise,  # Noise amplitude
+            'correlation': np.zeros(X.shape, dtype=complex),  # Accumulated correlation
+            'last_update': 0.0
+        }
+        
+        return self.noise_field
+    
+    def electron_wavefunction(self, X, Y, x0, y0, sigma=0.2):
+        """
+        Electron wavefunction (Gaussian packet)
+        """
+        psi = np.exp(-((X - x0)**2 + (Y - y0)**2) / (4 * sigma**2))
+        psi = psi / np.sqrt((np.abs(psi)**2).sum())  # Normalize
+        return psi
+    
+    def double_slit_propagation(self, psi0, X, Y, distance=5.0):
+        """
+        Propagation through double slit
+        """
+        y1 = self.d / 2
+        y2 = -self.d / 2
+        
+        r1 = np.sqrt((X - distance)**2 + (Y - y1)**2)
+        r2 = np.sqrt((X - distance)**2 + (Y - y2)**2)
+        
+        epsilon = 1e-6
+        psi1 = (self.a / (r1 + epsilon)) * np.exp(1j * self.k * r1)
+        psi2 = (self.a / (r2 + epsilon)) * np.exp(1j * self.k * r2)
+        
+        return psi1 + psi2
+    
+    def imprint_electron(self, psi, current_time):
+        """
+        Electron "imprints" the noise
+        
+        Mechanism: ξ(x,t) → ξ(x,t) + g·|ψ(x,t)|²
+        """
+        if self.noise_field is None:
+            return
+        
+        # Calculate the imprint (proportional to probability density)
+        imprint = self.g_coupling * np.abs(psi)**2
+        
+        # Add to correlation with exponential decay from previous imprints
+        time_elapsed = current_time - self.noise_field['last_update']
+        decay_factor = np.exp(-self.gamma * time_elapsed)
+        
+        # Update correlation
+        self.noise_field['correlation'] = (
+            self.noise_field['correlation'] * decay_factor + 
+            imprint
+        )
+        
+        # Add electron to history
+        self.electron_history.append({
+            'psi': psi.copy(),
+            'time': current_time,
+            'imprint': imprint
+        })
+        
+        self.noise_field['last_update'] = current_time
+    
+    def compute_guidance_field(self, X, Y, current_time):
+        """
+        Compute guidance field from correlated noise
+        
+        Φ(x,t) = Σᵢ ψᵢ(x) · exp(-γ(t - tᵢ))
+        """
+        if len(self.electron_history) == 0:
+            # No memory yet - return base double slit pattern
+            return self.double_slit_propagation(
+                self.electron_wavefunction(X, Y, 0, 0), X, Y
+            )
+        
+        # Accumulate contributions from all past electrons
+        Phi = np.zeros(X.shape, dtype=complex)
+        
+        for electron in self.electron_history:
+            time_diff = current_time - electron['time']
+            decay = np.exp(-self.gamma * time_diff)
+            
+            # Each electron contributes to guidance field
+            psi_prop = self.double_slit_propagation(electron['psi'], X, Y)
+            Phi += psi_prop * decay
+        
+        # Add uncorrelated component (fresh noise)
+        if self.noise_field is not None:
+            Phi += 0.1 * self.noise_field['xi']
+        
+        return Phi
+    
+    def compute_velocity_field(self, X, Y, Phi):
+        """
+        v = (ℏ/m) * Im[∇Φ/Φ]
+        """
+        dx = X[0, 1] - X[0, 0]
+        dy = Y[1, 0] - Y[0, 0]
+        
+        grad_phi_x = np.gradient(Phi, dx, axis=1)
+        grad_phi_y = np.gradient(Phi, dy, axis=0)
+        
+        Phi_safe = np.where(np.abs(Phi) > 1e-10, Phi, 1e-10 + 0j)
+        
+        vx = (self.hbar / self.m) * np.imag(grad_phi_x / Phi_safe)
+        vy = (self.hbar / self.m) * np.imag(grad_phi_y / Phi_safe)
+        
+        return vx, vy
+    
+    def integrate_trajectory(self, x0, y0, X, Y, Phi, t_max=8.0, dt=0.01):
+        """
+        Integrate trajectory with guidance field
+        """
+        vx, vy = self.compute_velocity_field(X, Y, Phi)
+        
+        x_coords = X[0, :]
+        y_coords = Y[:, 0]
+        
+        vx_interp = RectBivariateSpline(y_coords, x_coords, vx, kx=1, ky=1)
+        vy_interp = RectBivariateSpline(y_coords, x_coords, vy, kx=1, ky=1)
+        
+        def velocity(t, state):
+            x, y = state
+            if x < x_coords[0] or x > x_coords[-1] or \
+               y < y_coords[0] or y > y_coords[-1]:
+                return [0, 0]
+            
+            return [float(vx_interp(y, x)), float(vy_interp(y, x))]
+        
+        sol = solve_ivp(
+            velocity, [0, t_max], [x0, y0],
+            method='RK45', max_step=dt, dense_output=True
+        )
+        
+        t_eval = np.linspace(0, sol.t[-1], 200)
+        trajectory = sol.sol(t_eval).T
+        
+        return trajectory
+    
+    def simulate_sequential_electrons(self, n_electrons=100, 
+                                      x_range=(0, 10), y_range=(-3, 3),
+                                      grid_points=200, 
+                                      time_interval=1.0,
+                                      t_max=6.0):
+        """
+        Main simulation: Sequential electron emission with memory
+        
+        Parameters:
+        -----------
+        n_electrons : int
+            Number of electrons
+        time_interval : float
+            Time interval between emissions (Δt)
+        """
+        print("=" * 60)
+        print("CFG MEMORY SIMULATOR")
+        print("=" * 60)
+        print(f"Memory time τ = {self.tau_memory:.2f} s")
+        print(f"Time interval Δt = {time_interval:.2f} s")
+        print(f"Ratio Δt/τ = {time_interval/self.tau_memory:.2f}")
+        print(f"Expected memory correlation: {np.exp(-self.gamma * time_interval):.3f}")
+        print("=" * 60)
+        print()
+        
+        # Setup grid
+        x = np.linspace(x_range[0], x_range[1], grid_points)
+        y = np.linspace(y_range[0], y_range[1], grid_points)
+        X, Y = np.meshgrid(x, y)
+        
+        # Initialize noise field
+        print("Initializing uncorrelated noise field...")
+        self.initialize_noise_field(X, Y)
+        
+        # Storage for results
+        trajectories = []
+        final_positions = []
+        visibility_evolution = []
+        
+        # Simulate electrons one by one
+        for i in range(n_electrons):
+            current_time = i * time_interval
+            
+            if (i + 1) % 10 == 0 or i == 0:
+                print(f"\nElectron {i+1}/{n_electrons} (t = {current_time:.1f}s)")
+                print(f"  History size: {len(self.electron_history)}")
+            
+            # Create electron wavefunction
+            psi_initial = self.electron_wavefunction(X, Y, x0=0, y0=0)
+            
+            # Imprint current electron on noise
+            self.imprint_electron(psi_initial, current_time)
+            
+            # Compute guidance field (includes memory from past electrons)
+            Phi = self.compute_guidance_field(X, Y, current_time)
+            
+            # Sample initial position from |ψ|²
+            prob = np.abs(psi_initial)**2
+            prob = prob / prob.sum()
+            idx = np.random.choice(prob.size, p=prob.ravel())
+            row, col = np.unravel_index(idx, prob.shape)
+            x0_particle = x[col]
+            y0_particle = y[row]
+            
+            # Integrate trajectory
+            try:
+                traj = self.integrate_trajectory(
+                    x0_particle, y0_particle, X, Y, Phi, t_max=t_max
+                )
+                trajectories.append(traj)
+                final_positions.append(traj[-1, 1])  # Final y-position
+                
+                # Calculate visibility after this electron
+                if len(final_positions) >= 10:
+                    vis = self.calculate_visibility(final_positions, y)
+                    visibility_evolution.append(vis)
+            except Exception as e:
+                print(f"  Error: {e}")
+                continue
+        
+        print(f"\n✓ Completed {len(trajectories)} trajectories")
+        
+        return {
+            'trajectories': trajectories,
+            'final_positions': final_positions,
+            'visibility_evolution': visibility_evolution,
+            'X': X,
+            'Y': Y,
+            'Phi_final': self.compute_guidance_field(X, Y, n_electrons * time_interval),
+            'noise_correlation': self.noise_field['correlation'],
+            'electron_history': self.electron_history,
+            'params': {
+                'gamma': self.gamma,
+                'tau': self.tau_memory,
+                'dt': time_interval,
+                'n_electrons': len(trajectories)
+            }
+        }
+    
+    def calculate_visibility(self, positions, y_grid):
+        """
+        Calculate visibility of interference pattern
+        V = (I_max - I_min) / (I_max + I_min)
+        """
+        hist, _ = np.histogram(positions, bins=50, range=(y_grid[0], y_grid[-1]))
+        if hist.max() > 0 and hist.min() >= 0:
+            return (hist.max() - hist.min()) / (hist.max() + hist.min())
+        return 0.0
+    
+    def plot_results(self, results, figsize=(18, 10)):
+        """
+        Comprehensive visualization
+        """
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        X = results['X']
+        Y = results['Y']
+        trajectories = results['trajectories']
+        final_positions = results['final_positions']
+        Phi = results['Phi_final']
+        correlation = results['noise_correlation']
+        
+        # 1. Guidance field intensity
+        ax1 = fig.add_subplot(gs[0, 0])
+        im1 = ax1.imshow(
+            np.abs(Phi)**2,
+            extent=[X.min(), X.max(), Y.min(), Y.max()],
+            aspect='auto', cmap='hot', origin='lower'
+        )
+        ax1.set_title('Guidance Field $|\\Phi|^2$\n(with Memory)')
+        ax1.set_xlabel('x')
+        ax1.set_ylabel('y')
+        plt.colorbar(im1, ax=ax1)
+        
+        # 2. Noise correlation
+        ax2 = fig.add_subplot(gs[0, 1])
+        im2 = ax2.imshow(
+            np.real(correlation),
+            extent=[X.min(), X.max(), Y.min(), Y.max()],
+            aspect='auto', cmap='RdBu_r', origin='lower'
+        )
+        ax2.set_title('Noise Correlation\n(Accumulated Memory)')
+        ax2.set_xlabel('x')
+        ax2.set_ylabel('y')
+        plt.colorbar(im2, ax=ax2)
+        
+        # 3. Trajectories
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.imshow(
+            np.abs(Phi)**2,
+            extent=[X.min(), X.max(), Y.min(), Y.max()],
+            aspect='auto', cmap='gray', alpha=0.3, origin='lower'
+        )
+        for traj in trajectories[::2]:  # Plot every 2nd for clarity
+            ax3.plot(traj[:, 0], traj[:, 1], 'b-', alpha=0.2, linewidth=0.5)
+        ax3.set_title(f'Bohmian Trajectories\n({len(trajectories)} electrons)')
+        ax3.set_xlabel('x')
+        ax3.set_ylabel('y')
+        ax3.axhline(y=self.d/2, color='red', linestyle='--', alpha=0.5)
+        ax3.axhline(y=-self.d/2, color='red', linestyle='--', alpha=0.5)
+        
+        # 4. Final position histogram
+        ax4 = fig.add_subplot(gs[1, :])
+        ax4.hist(final_positions, bins=60, alpha=0.7, color='blue', 
+                edgecolor='black', density=True)
+        ax4.set_title('Final Position Distribution')
+        ax4.set_xlabel('y position')
+        ax4.set_ylabel('Probability density')
+        ax4.grid(True, alpha=0.3)
+        
+        # Theoretical prediction
+        y_theory = Y[:, 0]
+        prob_theory = np.abs(Phi[:, -1])**2
+        prob_theory = prob_theory / (prob_theory.sum() * (y_theory[1] - y_theory[0]))
+        ax4.plot(y_theory, prob_theory, 'r-', linewidth=2, 
+                label='Theory (with memory)')
+        ax4.legend()
+        
+        # 5. Visibility evolution
+        if len(results['visibility_evolution']) > 0:
+            ax5 = fig.add_subplot(gs[2, 0])
+            n_electrons = np.arange(10, len(final_positions) + 1)
+            ax5.plot(n_electrons, results['visibility_evolution'], 'o-', 
+                    color='green', linewidth=2, markersize=4)
+            ax5.set_title('Visibility Evolution')
+            ax5.set_xlabel('Number of electrons')
+            ax5.set_ylabel('Visibility V')
+            ax5.grid(True, alpha=0.3)
+            ax5.set_ylim([0, 1])
+        
+        # 6. Memory decay illustration
+        ax6 = fig.add_subplot(gs[2, 1])
+        times = np.linspace(0, 5 * self.tau_memory, 100)
+        memory_strength = np.exp(-self.gamma * times)
+        ax6.plot(times, memory_strength, linewidth=2, color='purple')
+        ax6.axhline(y=np.exp(-1), color='red', linestyle='--', alpha=0.5,
+                   label=f'1/e at τ={self.tau_memory:.2f}s')
+        ax6.set_title('Memory Decay')
+        ax6.set_xlabel('Time (s)')
+        ax6.set_ylabel('Memory strength')
+        ax6.legend()
+        ax6.grid(True, alpha=0.3)
+        
+        # 7. Parameters text
+        ax7 = fig.add_subplot(gs[2, 2])
+        ax7.axis('off')
+        params_text = f"""
+        SIMULATION PARAMETERS
+        
+        Memory time τ: {self.tau_memory:.2f} s
+        Decay rate γ: {self.gamma:.3f} s⁻¹
+        Time interval Δt: {results['params']['dt']:.2f} s
+        Ratio Δt/τ: {results['params']['dt']/self.tau_memory:.2f}
+        
+        Coupling g: {self.g_coupling:.2f}
+        Slit separation: {self.d:.2f}
+        Wavelength λ: {self.wavelength:.2f}
+        
+        Electrons simulated: {results['params']['n_electrons']}
+        Successful trajectories: {len(trajectories)}
+        """
+        ax7.text(0.1, 0.5, params_text, fontsize=10, family='monospace',
+                verticalalignment='center')
+        
+        fig.suptitle('CFG with Quantum Memory - Full Results', 
+                    fontsize=16, fontweight='bold')
+        
+        return fig
+
+
+def compare_memory_vs_no_memory():
+    """
+    Compare results with and without memory
+    """
+    print("\n" + "="*60)
+    print("COMPARISON: Memory vs No Memory")
+    print("="*60 + "\n")
+    
+    # Common parameters
+    params = {
+        'n_electrons': 50,
+        'x_range': (0, 8),
+        'y_range': (-2, 2),
+        'grid_points': 150,
+        'time_interval': 1.0,
+        't_max': 5.0
+    }
+    
+    # Scenario 1: WITH MEMORY (γ small → τ large)
+    print("Scenario 1: WITH MEMORY (τ = 10s)")
+    sim_memory = CFGMemorySimulator(gamma=0.1)  # τ = 10s
+    results_memory = sim_memory.simulate_sequential_electrons(**params)
+    
+    # Scenario 2: NO MEMORY (γ large → τ small)
+    print("\nScenario 2: NO MEMORY (τ = 0.1s)")
+    sim_no_memory = CFGMemorySimulator(gamma=10.0)  # τ = 0.1s
+    results_no_memory = sim_no_memory.simulate_sequential_electrons(**params)
+    
+    # Plot comparison
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    
+    for idx, (results, title) in enumerate([
+        (results_memory, "WITH Memory (τ=10s)"),
+        (results_no_memory, "NO Memory (τ=0.1s)")
+    ]):
+        row = idx
+        
+        # Column 1: Guidance field
+        im = axes[row, 0].imshow(
+            np.abs(results['Phi_final'])**2,
+            extent=[0, 8, -2, 2],
+            aspect='auto', cmap='hot', origin='lower'
+        )
+        axes[row, 0].set_title(f'{title}\nGuidance Field')
+        axes[row, 0].set_ylabel('y')
+        plt.colorbar(im, ax=axes[row, 0])
+        
+        # Column 2: Trajectories
+        for traj in results['trajectories'][::2]:
+            axes[row, 1].plot(traj[:, 0], traj[:, 1], 
+                            'b-', alpha=0.15, linewidth=0.5)
+        axes[row, 1].set_title(f'{title}\nTrajectories')
+        axes[row, 1].set_xlim(0, 8)
+        axes[row, 1].set_ylim(-2, 2)
+        
+        # Column 3: Final distribution
+        axes[row, 2].hist(results['final_positions'], bins=40, 
+                         alpha=0.7, color='blue', density=True)
+        axes[row, 2].set_title(f'{title}\nFinal Distribution')
+        axes[row, 2].set_xlabel('y position')
+        
+        if row == 0:
+            axes[row, 2].set_ylabel('Probability density')
+    
+    plt.tight_layout()
+    plt.savefig('cfg_memory_comparison.png', dpi=300, bbox_inches='tight')
+    print("\n✓ Saved: cfg_memory_comparison.png")
+    
+    return results_memory, results_no_memory
+
+
+def main():
+    """
+    Main execution
+    """
+    print("\n" + "="*70)
+    print(" CFG WITH QUANTUM MEMORY - BREAKTHROUGH SIMULATION")
+    print("="*70)
+    print("\nKey Innovation: Electrons communicate through vacuum noise memory")
+    print("="*70 + "\n")
+    
+    # Create simulator with moderate memory
+    sim = CFGMemorySimulator(
+        gamma=0.2,  # τ = 5 seconds memory
+        coupling=1.5,
+        slit_separation=1.0,
+        wavelength=0.12
+    )
+    
+    # Run simulation
+    results = sim.simulate_sequential_electrons(
+        n_electrons=80,
+        time_interval=1.0,  # 1 second between electrons
+        grid_points=180,
+        t_max=5.0
+    )
+    
+    # Plot results
+    print("\nGenerating visualizations...")
+    fig = sim.plot_results(results)
+    plt.savefig('cfg_memory_full_results.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: cfg_memory_full_results.png")
+    
+    # Comparison
+    print("\nRunning comparison simulation...")
+    compare_memory_vs_no_memory()
+    
+    print("\n" + "="*70)
+    print("SIMULATION COMPLETE!")
+    print("="*70)
+    print("\nKey Findings:")
+    print(f"  • Memory time: τ = {sim.tau_memory:.1f} s")
+    print(f"  • Electrons: {len(results['trajectories'])}")
+    print(f"  • Final visibility: {results['visibility_evolution'][-1]:.3f}")
+    print("\nFiles created:")
+    print("  1. cfg_memory_full_results.png")
+    print("  2. cfg_memory_comparison.png")
+    print("="*70)
+    
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
